@@ -112,31 +112,83 @@ def start_iperf_servers(flows):
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
     return procs
 
-def start_iperf_clients(flows, classic_tcp: bool = False):
-    """Start iperf3 clients for selected flows (in ns_s).
-    Set classic_tcp=True to run the classic flow over TCP (default is UDP).
+def start_iperf_clients(flows,
+                        classic_tcp: bool = False,
+                        start_delay: float = 0.0,
+                        flow_order: str = 'l4s-first',
+                        base_duration: int = DURATION):
+    """Start iperf3 client flows in the sender namespace.
+
+    Behavior:
+      - Single flow (l4s or classic): run exactly base_duration seconds.
+      - Both flows: start first flow immediately, wait start_delay seconds, start second flow.
+        The first flow's iperf duration is extended by start_delay so both flows overlap for
+        a full base_duration after the second flow starts.
+
+    Returns:
+        (process_list, l4s_start_ts_ns, classic_start_ts_ns)
     """
     procs = []
-    if flows in ('both', 'l4s'):
-        print(f"[+] Starting L4S iperf3 client in ns_s (port 5201, CC={CC_ALGO})...")
-        procs.append(subprocess.Popen([
+    l4s_start_ts_ns = None
+    classic_start_ts_ns = None
+
+    def _start_l4s(run_duration):
+        print(f"[+] Starting L4S iperf3 client in ns_s (port {PORT_L4S}, CC={CC_ALGO}, t={run_duration})...")
+        return subprocess.Popen([
             "sudo", "ip", "netns", "exec", NS_SENDER,
-            "iperf3", "-c", DST_IP, "-p", str(PORT_L4S), "-t", str(DURATION), "-C", CC_ALGO
-        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
-    if flows in ('both', 'classic'):
+            "iperf3", "-c", DST_IP, "-p", str(PORT_L4S), "-t", str(run_duration), "-C", CC_ALGO
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    def _start_classic(run_duration):
         if classic_tcp:
-            print(f"[+] Starting classic iperf3 client in ns_s (port 5202, TCP)...")
-            procs.append(subprocess.Popen([
+            print(f"[+] Starting classic iperf3 client in ns_s (port {PORT_CLASSIC}, TCP, t={run_duration})...")
+            return subprocess.Popen([
                 "sudo", "ip", "netns", "exec", NS_SENDER,
-                "iperf3", "-c", DST_IP, "-p", str(PORT_CLASSIC), "-t", str(DURATION)
-            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
+                "iperf3", "-c", DST_IP, "-p", str(PORT_CLASSIC), "-t", str(run_duration)
+            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         else:
-            print(f"[+] Starting classic iperf3 client in ns_s (port 5202, UDP)...")
-            procs.append(subprocess.Popen([
+            print(f"[+] Starting classic iperf3 client in ns_s (port {PORT_CLASSIC}, UDP, t={run_duration})...")
+            return subprocess.Popen([
                 "sudo", "ip", "netns", "exec", NS_SENDER,
-                "iperf3", "-c", DST_IP, "-p", str(PORT_CLASSIC), "-u", "-t", str(DURATION)
-            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
-    return procs
+                "iperf3", "-c", DST_IP, "-p", str(PORT_CLASSIC), "-u", "-t", str(run_duration)
+            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    if flows == 'l4s':
+        p = _start_l4s(base_duration)
+        procs.append(p)
+        l4s_start_ts_ns = time.time_ns()
+    elif flows == 'classic':
+        p = _start_classic(base_duration)
+        procs.append(p)
+        classic_start_ts_ns = time.time_ns()
+    else:  # both flows
+        # Extend duration of first so total overlap after second start is base_duration.
+        overlap_extension = start_delay if start_delay > 0 else 0.0
+        first_duration = base_duration + int(overlap_extension)  # keep iperf integer seconds
+        second_duration = base_duration
+        if flow_order == 'l4s-first':
+            p1 = _start_l4s(first_duration)
+            l4s_start_ts_ns = time.time_ns()
+            procs.append(p1)
+            if start_delay > 0.0:
+                print(f"[i] Waiting {start_delay:.3f}s before starting classic flow...")
+                time.sleep(start_delay)
+            p2 = _start_classic(second_duration)
+            classic_start_ts_ns = time.time_ns()
+            procs.append(p2)
+        else:
+            p1 = _start_classic(first_duration)
+            classic_start_ts_ns = time.time_ns()
+            procs.append(p1)
+            if start_delay > 0.0:
+                print(f"[i] Waiting {start_delay:.3f}s before starting L4S flow...")
+                time.sleep(start_delay)
+            p2 = _start_l4s(second_duration)
+            l4s_start_ts_ns = time.time_ns()
+            procs.append(p2)
+
+    print(f"[i] Flow order: {flow_order} | Start delay: {start_delay:.3f}s")
+    return procs, l4s_start_ts_ns, classic_start_ts_ns
 
 
 def parse_ss(output):
@@ -238,10 +290,18 @@ def main():
     parser.add_argument('--outdir',
                         default=OUTDIR_DEFAULT,
                         help='Directory for CSV and plot outputs (default: %(default)s; env override: DUALPI2_OUTDIR)')
+    parser.add_argument('--start-delay', type=float, default=0.0,
+                        help='Delay in seconds between starting two flows when --flows both (default: 0.0 = simultaneous)')
+    parser.add_argument('--flow-order', choices=['l4s-first', 'classic-first'], default='l4s-first',
+                        help='Which flow starts first when --flows both (default: l4s-first)')
+    parser.add_argument('--debug-samples', type=int, default=0,
+                        help='Print debug info for first N samples (0=disabled)')
     args = parser.parse_args()
     flows = args.flows
     classic_tcp = args.classic_tcp
     outdir = args.outdir
+    start_delay = max(0.0, float(args.start_delay))
+    flow_order = args.flow_order
 
     # Ensure outdir exists
     os.makedirs(outdir, exist_ok=True)
@@ -261,7 +321,7 @@ def main():
     server_procs = start_iperf_servers(flows)
     time.sleep(1)
 
-    # Prepare CSV
+    # Prepare CSV (append metadata columns for flow ordering and start timestamps)
     fields = [
         "timestamp", "timestamp_ns", "scheduled_timestamp_ns", "sample_index", "rel_ns", "cmd_duration_ms",
         "rtt", "pacing_rate", "delivery_rate", "cwnd",
@@ -269,21 +329,38 @@ def main():
         "delay_C", "delay_L", "credit", "ecn_mark", "step_marks", "pkts_in_c", "pkts_in_l",
         "c_marks", "l_marks",  # optional extended counters
         "dq_count", "eq_count",  # raw enqueue/dequeue counters
-        "dq_delta", "eq_delta"   # per-sample differences
+        "dq_delta", "eq_delta",  # per-sample differences
+        "start_delay", "flow_order", "l4s_start_ts_ns", "classic_start_ts_ns"  # run metadata
     ]
     f = open(outfile, "w", newline="")
     writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
     writer.writeheader()
 
-    # Start iperf3 clients
-    client_procs = start_iperf_clients(flows, classic_tcp)
+    # Start iperf3 clients using refactored function
+    client_procs, l4s_start_ts_ns, classic_start_ts_ns = start_iperf_clients(
+        flows, classic_tcp, start_delay=start_delay, flow_order=flow_order
+    )
+
+    # Second flow start timestamp used for duration guard
+    if flows == 'both':
+        second_flow_start_ts_ns = classic_start_ts_ns if flow_order == 'l4s-first' else l4s_start_ts_ns
+    else:
+        second_flow_start_ts_ns = l4s_start_ts_ns or classic_start_ts_ns
+
+    # Brief health check after launch and delay
+    time.sleep(1.0)
+    early_exit = [p for p in client_procs if p.poll() is not None]
+    if early_exit:
+        print(f"[!] Warning: {len(early_exit)} client(s) exited early. They may have failed to connect. Continuing metrics collection regardless.")
 
     print(f"[+] Monitoring metrics for flows: {flows} (Ctrl+C to stop early)")
     try:
+        # Align start reference to the moment the first client was started
         start_monotonic_ns = time.monotonic_ns()
         epoch_ref_ns = time.time_ns()
         sample_index = 0
         next_sample_ns = start_monotonic_ns
+
 
         # Initialize previous counters for delta computation
         prev_dq = None
@@ -298,8 +375,10 @@ def main():
             # wrap-around (32-bit)
             return (curr + UINT32_MAX) - prev
 
-        # Monitor until all clients finish
-        while any([p.poll() is None for p in client_procs]):
+        # Monitor until processes end AND at least DURATION seconds elapsed after second flow start.
+        min_end_ns = (second_flow_start_ts_ns or time.time_ns()) + int(DURATION * 1e9)
+        debug_limit = int(args.debug_samples)
+        while any([p.poll() is None for p in client_procs]) or time.time_ns() < min_end_ns:
             now_mono = time.monotonic_ns()
             if now_mono < next_sample_ns:
                 time.sleep((next_sample_ns - now_mono) / 1e9)
@@ -317,12 +396,27 @@ def main():
             row["eq_delta"] = diff_u32(prev_eq, curr_eq)
             prev_dq, prev_eq = curr_dq, curr_eq
 
+            # Add run-level metadata (constant values per row)
+            row["start_delay"] = start_delay
+            row["flow_order"] = flow_order
+            row["l4s_start_ts_ns"] = l4s_start_ts_ns
+            row["classic_start_ts_ns"] = classic_start_ts_ns
+            if debug_limit > 0 and sample_index < debug_limit:
+                print(f"[dbg] sample={sample_index} rtt={row.get('rtt')} delay_C={row.get('delay_C')} delay_L={row.get('delay_L')} credit={row.get('credit')} prob={row.get('prob')}")
             writer.writerow(row)
             f.flush()
 
             sample_index += 1
             next_sample_ns += int(INTERVAL * 1e9)
-        print("[+] iperf3 clients finished.")
+        # Clean up any lingering clients (they should have exited naturally)
+        for p in client_procs:
+            if p.poll() is None:
+                p.send_signal(signal.SIGINT)
+                try:
+                    p.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    p.terminate()
+        print("[+] Data collection finished (ensured full duration after second start).")
     except KeyboardInterrupt:
         print("[!] Experiment interrupted by user.")
         for p in client_procs:
