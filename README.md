@@ -110,13 +110,3 @@ Negative delays are clamped to `0.0`.
 ```
 pip install pandas matplotlib
 ```
-
-## Future Ideas
-- Separate per-flow TCP parsing if multiple TCP sockets present.
-- Optional JSON summary for automation pipelines.
-
-## License / Attribution
-Internal lab usage; no explicit license header added.
-
----
-For questions or enhancements, modify `dualpi2_metrics.py` directly.
