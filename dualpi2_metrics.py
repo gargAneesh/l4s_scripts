@@ -145,7 +145,7 @@ def start_iperf_clients(flows,
 
     def _start_l4s(run_duration):
         # Ensure prague CC is set at namespace level (iperf2 doesn't support -C)
-        set_namespace_tcp_cc(NS_SENDER, CC_ALGO)
+        # set_namespace_tcp_cc(NS_SENDER, CC_ALGO)
         print(f"[+] Starting L4S iperf client in ns_s (port {PORT_L4S}, CC={CC_ALGO}, t={run_duration})...")
         return subprocess.Popen([
             "sudo", "ip", "netns", "exec", NS_SENDER,
