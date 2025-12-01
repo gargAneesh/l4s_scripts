@@ -3,11 +3,11 @@
 DualPI2 Metrics Collection Tool
 ================================
 
-This script automates the collection and plotting of DualPI2 qdisc and TCP metrics from network namespaces using iperf3, ss, and tc utilities.
+This script automates the collection and plotting of DualPI2 qdisc and TCP metrics from network namespaces using iperf (iperf2), ss, and tc utilities.
 
 Features:
 ---------
-- Runs L4S and/or classic flows between sender/receiver namespaces using iperf3 (TCP Prague and UDP).
+- Runs L4S and/or classic flows between sender/receiver namespaces using iperf2 (TCP Prague and UDP).
 - Periodically samples metrics using `ss -tin` and `tc -s qdisc show`.
 - Records high-resolution timestamps for each sample.
 - Writes all metrics and timestamps to a CSV file.
@@ -36,8 +36,8 @@ Example:
 
 What it does:
 -------------
-- Starts iperf3 servers in sender namespace(s) on ports 5201 (L4S) and/or 5202 (classic).
-- Starts iperf3 clients in receiver namespace(s) for L4S (TCP Prague) and/or classic (UDP/TCP).
+- Starts iperf2 servers in sender namespace(s) on ports 5201 (L4S) and/or 5202 (classic).
+- Starts iperf2 clients in receiver namespace(s) for L4S (TCP Prague) and/or classic (UDP/TCP).
 - Every INTERVAL seconds, collects TCP and qdisc metrics, timestamps, and writes to CSV.
 - After run, generates:
      - delays/rtt plot (_delays_rtt.png)
@@ -48,7 +48,7 @@ What it does:
 Dependencies:
 -------------
 - Python 3
-- iperf3, iproute2/tc, ss utilities
+- iperf (iperf2), iproute2/tc, ss utilities
 - pandas, matplotlib (for plotting)
 
 See script configuration section for tunable parameters.
@@ -79,7 +79,7 @@ DST_IP = "172.20.1.2"          # receiver IP
 NS_SENDER = "ns_s"
 NS_RECEIVER = "ns_r"
 TC_PATH = "/home/aneesh/moment_lab/iproute2/tc/tc"       # adjust if needed
-DURATION = 60                  # iperf3 run time in seconds
+DURATION = 60                  # iperf2 run time in seconds
 CC_ALGO = "prague"             # congestion control algorithm
 PORT_L4S = 5201
 PORT_CLASSIC = 5202
@@ -98,26 +98,37 @@ def run(cmd, **kwargs):
 
 
 def start_iperf_servers(flows):
-    """Start iperf3 servers for selected flows (in ns_r)."""
+    """Start iperf servers for selected flows (in ns_r). iperf2 binary is usually `iperf`."""
     procs = []
     if flows in ('both', 'l4s'):
-        print("[+] Starting L4S iperf3 server in ns_r (port 5201)...")
+        print("[+] Starting L4S iperf server in ns_r (port 5201)...")
         procs.append(subprocess.Popen([
-            "sudo", "ip", "netns", "exec", NS_RECEIVER, "iperf3", "-s", "-p", str(PORT_L4S)
+            "sudo", "ip", "netns", "exec", NS_RECEIVER, "iperf", "-s", "-p", str(PORT_L4S)
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
     if flows in ('both', 'classic'):
-        print("[+] Starting classic iperf3 server in ns_r (port 5202)...")
+        print("[+] Starting classic iperf server in ns_r (port 5202)...")
         procs.append(subprocess.Popen([
-            "sudo", "ip", "netns", "exec", NS_RECEIVER, "iperf3", "-s", "-p", str(PORT_CLASSIC)
+            "sudo", "ip", "netns", "exec", NS_RECEIVER, "iperf", "-s", "-p", str(PORT_CLASSIC)
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
     return procs
+
+def set_namespace_tcp_cc(namespace: str, algo: str):
+    """Set TCP congestion control in a given netns to `algo` (best-effort)."""
+    try:
+        subprocess.run(["sudo", "ip", "netns", "exec", namespace, "sysctl", f"net.ipv4.tcp_congestion_control={algo}"],
+                       check=True, capture_output=True)
+        return True
+    except Exception as e:
+        print(f"[!] Failed to set TCP CC to {algo} in {namespace}: {e}")
+        return False
+
 
 def start_iperf_clients(flows,
                         classic_tcp: bool = False,
                         start_delay: float = 0.0,
                         flow_order: str = 'l4s-first',
                         base_duration: int = DURATION):
-    """Start iperf3 client flows in the sender namespace.
+    """Start iperf2 client flows in the sender namespace.
 
     Behavior:
       - Single flow (l4s or classic): run exactly base_duration seconds.
@@ -133,24 +144,26 @@ def start_iperf_clients(flows,
     classic_start_ts_ns = None
 
     def _start_l4s(run_duration):
-        print(f"[+] Starting L4S iperf3 client in ns_s (port {PORT_L4S}, CC={CC_ALGO}, t={run_duration})...")
+        # Ensure prague CC is set at namespace level (iperf2 doesn't support -C)
+        set_namespace_tcp_cc(NS_SENDER, CC_ALGO)
+        print(f"[+] Starting L4S iperf client in ns_s (port {PORT_L4S}, CC={CC_ALGO}, t={run_duration})...")
         return subprocess.Popen([
             "sudo", "ip", "netns", "exec", NS_SENDER,
-            "iperf3", "-c", DST_IP, "-p", str(PORT_L4S), "-t", str(run_duration), "-C", CC_ALGO
+            "iperf", "-c", DST_IP, "-p", str(PORT_L4S), "-t", str(run_duration)
         ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     def _start_classic(run_duration):
         if classic_tcp:
-            print(f"[+] Starting classic iperf3 client in ns_s (port {PORT_CLASSIC}, TCP, t={run_duration})...")
+            print(f"[+] Starting classic iperf client in ns_s (port {PORT_CLASSIC}, TCP, t={run_duration})...")
             return subprocess.Popen([
                 "sudo", "ip", "netns", "exec", NS_SENDER,
-                "iperf3", "-c", DST_IP, "-p", str(PORT_CLASSIC), "-t", str(run_duration)
+                "iperf", "-c", DST_IP, "-p", str(PORT_CLASSIC), "-t", str(run_duration)
             ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         else:
-            print(f"[+] Starting classic iperf3 client in ns_s (port {PORT_CLASSIC}, UDP, t={run_duration})...")
+            print(f"[+] Starting classic iperf client in ns_s (port {PORT_CLASSIC}, UDP, t={run_duration})...")
             return subprocess.Popen([
                 "sudo", "ip", "netns", "exec", NS_SENDER,
-                "iperf3", "-c", DST_IP, "-p", str(PORT_CLASSIC), "-u", "-t", str(run_duration)
+                "iperf", "-c", DST_IP, "-p", str(PORT_CLASSIC), "-u", "-t", str(run_duration)
             ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     if flows == 'l4s':
@@ -317,7 +330,7 @@ def main():
     classic_desc = "TCP" if classic_tcp else "UDP"
     print(f"[i] L4S flow: {l4s_desc} | Classic flow: {classic_desc} | Flows: {flows}")
 
-    # Start iperf3 servers
+    # Start iperf2 servers
     server_procs = start_iperf_servers(flows)
     time.sleep(1)
 
@@ -336,7 +349,7 @@ def main():
     writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
     writer.writeheader()
 
-    # Start iperf3 clients using refactored function
+    # Start iperf2 clients using refactored function
     client_procs, l4s_start_ts_ns, classic_start_ts_ns = start_iperf_clients(
         flows, classic_tcp, start_delay=start_delay, flow_order=flow_order
     )
@@ -351,7 +364,14 @@ def main():
     time.sleep(1.0)
     early_exit = [p for p in client_procs if p.poll() is not None]
     if early_exit:
-        print(f"[!] Warning: {len(early_exit)} client(s) exited early. They may have failed to connect. Continuing metrics collection regardless.")
+        print(f"[!] Warning: {len(early_exit)} client(s) exited early. They may have failed to connect.")
+        for i, p in enumerate(early_exit, 1):
+            try:
+                out = p.stdout.read() if p.stdout else ""
+                print(f"[!] iperf client #{i} output (truncated):\n{out[:500]}")
+            except Exception:
+                pass
+        print("[i] Continuing metrics collection regardless.")
 
     print(f"[+] Monitoring metrics for flows: {flows} (Ctrl+C to stop early)")
     try:
@@ -422,7 +442,7 @@ def main():
         for p in client_procs:
             p.send_signal(signal.SIGINT)
     finally:
-        # Stop iperf3 servers
+        # Stop iperf2 servers
         for p in server_procs:
             p.terminate()
         f.close()
