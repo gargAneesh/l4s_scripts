@@ -137,7 +137,7 @@ def start_iperf_clients(flows,
         return subprocess.Popen([
             "sudo", "ip", "netns", "exec", NS_SENDER,
             "iperf3", "-c", DST_IP, "-p", str(PORT_L4S), "-t", str(run_duration), "-C", CC_ALGO
-        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _start_classic(run_duration):
         if classic_tcp:
@@ -145,13 +145,13 @@ def start_iperf_clients(flows,
             return subprocess.Popen([
                 "sudo", "ip", "netns", "exec", NS_SENDER,
                 "iperf3", "-c", DST_IP, "-p", str(PORT_CLASSIC), "-t", str(run_duration)
-            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             print(f"[+] Starting classic iperf3 client in ns_s (port {PORT_CLASSIC}, UDP, t={run_duration})...")
             return subprocess.Popen([
                 "sudo", "ip", "netns", "exec", NS_SENDER,
                 "iperf3", "-c", DST_IP, "-p", str(PORT_CLASSIC), "-u", "-t", str(run_duration)
-            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     if flows == 'l4s':
         p = _start_l4s(base_duration)
@@ -253,6 +253,15 @@ def parse_tc(output):
         m = re.search(rf"\b{f}\s+(\d+)", output)
         metrics[f] = int(m.group(1)) if m else None
 
+    # Extract backlog for the DualPI2 block specifically (bytes and packets)
+    # Matches the dualpi2 section up to the next qdisc block or end of string
+    block = re.search(r"(qdisc\s+dualpi2.*?)(?:\nqdisc|\Z)", output, re.S | re.I)
+    if block:
+        b = re.search(r"backlog\s+(\d+)b\s+(\d+)p", block.group(1))
+        if b:
+            metrics['backlog_bytes'] = int(b.group(1))
+            metrics['backlog_packets'] = int(b.group(2))
+
     return metrics
 
 
@@ -303,6 +312,18 @@ def main():
     start_delay = max(0.0, float(args.start_delay))
     flow_order = args.flow_order
 
+    # Reset qdisc counters to start clean each run
+    try:
+        print("[i] Resetting DualPI2 qdisc via re_init_qdisc.sh...")
+        subprocess.run(
+            ["/bin/bash", "/home/aneesh/moment_lab/Scripts/re_init_qdisc.sh"],
+            check=True
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"[!] re_init_qdisc.sh failed: {e}. Continuing.")
+    except Exception as e:
+        print(f"[!] Failed to reset qdisc: {e}. Continuing.")
+
     # Ensure outdir exists
     os.makedirs(outdir, exist_ok=True)
     print(f"[i] Output directory: {outdir}")
@@ -330,6 +351,7 @@ def main():
         "c_marks", "l_marks",  # optional extended counters
         "dq_count", "eq_count",  # raw enqueue/dequeue counters
         "dq_delta", "eq_delta",  # per-sample differences
+        "backlog_bytes", "backlog_packets",  # instantaneous backlog from dualpi2 block
         "start_delay", "flow_order", "l4s_start_ts_ns", "classic_start_ts_ns"  # run metadata
     ]
     f = open(outfile, "w", newline="")
@@ -375,10 +397,11 @@ def main():
             # wrap-around (32-bit)
             return (curr + UINT32_MAX) - prev
 
-        # Monitor until processes end AND at least DURATION seconds elapsed after second flow start.
+        # Hard time guard: sample until at least DURATION seconds after second flow start.
+        # After the guard, we stop regardless of client state and clean up lingering clients.
         min_end_ns = (second_flow_start_ts_ns or time.time_ns()) + int(DURATION * 1e9)
         debug_limit = int(args.debug_samples)
-        while any([p.poll() is None for p in client_procs]) or time.time_ns() < min_end_ns:
+        while time.time_ns() < min_end_ns:
             now_mono = time.monotonic_ns()
             if now_mono < next_sample_ns:
                 time.sleep((next_sample_ns - now_mono) / 1e9)
@@ -505,6 +528,21 @@ def main():
                 plt.legend()
                 plt.grid(True)
                 png = os.path.join(outdir, base_prefix + '_marks.png')
+                plt.tight_layout()
+                plt.savefig(png)
+                plt.close()
+                print(f"[+] Plot written to {png}")
+
+            # Plot queue backlog (packets) over time
+            if 'backlog_packets' in df.columns:
+                plt.figure(figsize=(12, 4))
+                plt.plot(df.index, df['backlog_packets'], label='backlog_packets', color='tab:gray')
+                plt.xlabel('time')
+                plt.ylabel('packets')
+                plt.title('Queue Backlog (packets) over time')
+                plt.legend()
+                plt.grid(True)
+                png = os.path.join(outdir, base_prefix + '_queue_backlog.png')
                 plt.tight_layout()
                 plt.savefig(png)
                 plt.close()
