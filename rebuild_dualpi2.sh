@@ -3,7 +3,7 @@ set -e
 
 # --- Configurable paths ---
 MODULE_NAME=sch_dualpi2
-SRC_KO_PATH=~/moment_lab/linux/net/sched/sch_dualpi2.ko
+SRC_KO_PATH=/your-path/linux/net/sched/sch_dualpi2.ko
 SYS_KO_PATH=/lib/modules/$(uname -r)/kernel/net/sched/sch_dualpi2.ko
 
 echo "[INFO] Deleting existing namespaces..."

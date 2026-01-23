@@ -21,7 +21,7 @@ INTERVAL = 0.5            # seconds between metric samples
 DURATION = 60             # iperf3 client duration per flow (seconds)
 VETH_DEVICE = "veth-s"
 DST_IP = "172.20.1.2"
-TC_PATH = "/home/aneesh/moment_lab/iproute2/tc/tc"
+TC_PATH = "your-directory/iproute2/tc/tc"
 PORT_L4S = 5201
 PORT_CLASSIC = 5202
 CC_ALGO = "prague"
@@ -110,13 +110,3 @@ Negative delays are clamped to `0.0`.
 ```
 pip install pandas matplotlib
 ```
-
-## Future Ideas
-- Separate per-flow TCP parsing if multiple TCP sockets present.
-- Optional JSON summary for automation pipelines.
-
-## License / Attribution
-Internal lab usage; no explicit license header added.
-
----
-For questions or enhancements, modify `dualpi2_metrics.py` directly.
