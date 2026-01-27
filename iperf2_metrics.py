@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-DualPI2 Metrics Collection Tool
-================================
+DualPI2 Metrics Collection Tool (iperf2)
+========================================
 
-This script automates the collection and plotting of DualPI2 qdisc and TCP metrics from network namespaces using iperf3, ss, and tc utilities.
+This script automates the collection and plotting of DualPI2 qdisc and TCP metrics from network namespaces using iperf (v2), ss, and tc utilities.
 
 Features:
 ---------
-- Runs L4S and/or classic flows between sender/receiver namespaces using iperf3 (TCP Prague and UDP).
+- Runs L4S and/or classic flows between sender/receiver namespaces using iperf (TCP Prague and UDP).
 - Periodically samples metrics using `ss -tin` and `tc -s qdisc show`.
 - Records high-resolution timestamps for each sample.
 - Writes all metrics and timestamps to a CSV file.
@@ -17,41 +17,18 @@ Usage:
 ------
 1. Ensure you have the required namespaces (`ns_s`, `ns_r`), veth device, and iproute2/tc path configured.
 2. Run the script with Python 3:
-    python3 dualpi2_metrics.py [--flows both|l4s|classic]
+    python3 iperf2_metrics.py [--flows both|l4s|classic]
     - Default is both flows (L4S and classic).
     - Use --flows l4s to run only L4S (TCP Prague).
     - Use --flows classic to run only classic (UDP by default).
     - Add -T / --classic-tcp to send classic over TCP instead of UDP.
-3. After completion, CSV and PNG plots are saved in the current directory.
-
-Example:
-    # Run both flows; classic over UDP (default)
-    python3 dualpi2_metrics.py --flows both
-
-    # Run both flows; classic over TCP
-    python3 dualpi2_metrics.py --flows both -T
-
-    # Classic-only over TCP
-    python3 dualpi2_metrics.py --flows classic -T
-
-What it does:
--------------
-- Starts iperf3 servers in sender namespace(s) on ports 5201 (L4S) and/or 5202 (classic).
-- Starts iperf3 clients in receiver namespace(s) for L4S (TCP Prague) and/or classic (UDP/TCP).
-- Every INTERVAL seconds, collects TCP and qdisc metrics, timestamps, and writes to CSV.
-- After run, generates:
-     - delays/rtt plot (_delays_rtt.png)
-     - credit plot (_credit.png)
-     - probability plot (_probability.png)
-     - ECN/step marks plot (_marks.png)
+3. After completion, CSV and PNG plots are saved in the output directory.
 
 Dependencies:
 -------------
 - Python 3
-- iperf3, iproute2/tc, ss utilities
-- pandas, matplotlib (for plotting)
-
-See script configuration section for tunable parameters.
+- iperf (v2), iproute2/tc, ss utilities
+- pandas, matplotlib (for plotting; optional)
 """
 
 import subprocess
@@ -62,6 +39,7 @@ import signal
 from datetime import datetime
 import os
 import argparse
+from typing import Optional
 
 # optional plotting libs
 try:
@@ -78,11 +56,13 @@ VETH_DEVICE = "veth-s"         # egress interface with DualPI2
 DST_IP = "172.20.1.2"          # receiver IP
 NS_SENDER = "ns_s"
 NS_RECEIVER = "ns_r"
-TC_PATH = "your-directory/iproute2/tc/tc"       # adjust if needed
-DURATION = 60                  # iperf3 run time in seconds
+TC_PATH = "/home/aneesh/moment_lab/iproute2/tc/tc"       # adjust if needed; can be overridden via --tc-path
+DURATION = 60                  # iperf run time in seconds
 CC_ALGO = "prague"             # congestion control algorithm
 PORT_L4S = 5201
 PORT_CLASSIC = 5202
+TOOL_NAME = "iperf2"           # used for naming per-run output directory
+
 # OUTFILE will be constructed dynamically based on --outdir
 # You can override the default output directory via:
 #   1) CLI: --outdir /desired/path
@@ -92,33 +72,57 @@ OUTDIR_DEFAULT = os.environ.get("DUALPI2_OUTDIR", "/home/aneesh/moment_lab/test_
 
 # === UTILITY FUNCTIONS ===
 def run(cmd, **kwargs):
-    """Run a command and return output as string."""
+    """Run a shell command and return stdout as string."""
     return subprocess.run(cmd, shell=True, capture_output=True, text=True, **kwargs).stdout
 
 
+def kill_existing_servers():
+    """Best-effort kill of any existing iperf/iperf3 servers in receiver namespace.
+
+    Prevents port binding conflicts that cause silent server startup failures.
+    """
+    for bin_name in ("iperf3", "iperf"):
+        try:
+            subprocess.run(["sudo", "ip", "netns", "exec", NS_RECEIVER, "pkill", "-x", bin_name],
+                           capture_output=True)
+        except Exception:
+            pass
+
+
+def _set_namespace_tcp_cc(namespace: str, algo: str):
+    """Set TCP CC in a given netns to `algo` (best-effort)."""
+    try:
+        subprocess.run(["sudo", "ip", "netns", "exec", namespace, "sysctl", "-w", f"net.ipv4.tcp_congestion_control={algo}"],
+                       capture_output=True, text=True)
+    except Exception as e:
+        print(f"[!] Could not set TCP CC to {algo} in {namespace}: {e}")
+
 
 def start_iperf_servers(flows):
-    """Start iperf3 servers for selected flows (in ns_r)."""
+    """Start iperf (v2) servers for selected flows (in ns_r)."""
     procs = []
     if flows in ('both', 'l4s'):
-        print("[+] Starting L4S iperf3 server in ns_r (port 5201)...")
-        procs.append(subprocess.Popen([
-            "sudo", "ip", "netns", "exec", NS_RECEIVER, "iperf3", "-s", "-p", str(PORT_L4S)
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        print("[+] Starting L4S iperf server in ns_r (port 5201)...")
+        p = subprocess.Popen([
+            "sudo", "ip", "netns", "exec", NS_RECEIVER, "iperf", "-s", "-p", str(PORT_L4S)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        procs.append(p)
     if flows in ('both', 'classic'):
-        print("[+] Starting classic iperf3 server in ns_r (port 5202)...")
-        procs.append(subprocess.Popen([
-            "sudo", "ip", "netns", "exec", NS_RECEIVER, "iperf3", "-s", "-p", str(PORT_CLASSIC)
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        print("[+] Starting classic iperf server in ns_r (port 5202)...")
+        p = subprocess.Popen([
+            "sudo", "ip", "netns", "exec", NS_RECEIVER, "iperf", "-s", "-p", str(PORT_CLASSIC)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        procs.append(p)
     return procs
+
 
 def start_iperf_clients(flows,
                         classic_tcp: bool = False,
                         start_delay: float = 0.0,
                         flow_order: str = 'l4s-first',
                         base_duration: int = DURATION,
-                        classic_bw: str | None = None):
-    """Start iperf3 client flows in the sender namespace.
+                        classic_bw: Optional[str] = None):
+    """Start iperf (v2) client flows in the sender namespace.
 
     Behavior:
       - Single flow (l4s or classic): run exactly base_duration seconds.
@@ -134,25 +138,27 @@ def start_iperf_clients(flows,
     classic_start_ts_ns = None
 
     def _start_l4s(run_duration):
-        print(f"[+] Starting L4S iperf3 client in ns_s (port {PORT_L4S}, CC={CC_ALGO}, t={run_duration})...")
+        # Set CC via sysctl (iperf2 doesn't support -C)
+        _set_namespace_tcp_cc(NS_SENDER, CC_ALGO)
+        print(f"[+] Starting L4S iperf client in ns_s (port {PORT_L4S}, CC={CC_ALGO}, t={run_duration})...")
         return subprocess.Popen([
             "sudo", "ip", "netns", "exec", NS_SENDER,
-            "iperf3", "-c", DST_IP, "-p", str(PORT_L4S), "-t", str(run_duration), "-C", CC_ALGO
+            "iperf", "-c", DST_IP, "-p", str(PORT_L4S), "-t", str(run_duration)
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _start_classic(run_duration):
         if classic_tcp:
-            print(f"[+] Starting classic iperf3 client in ns_s (port {PORT_CLASSIC}, TCP, t={run_duration})...")
+            print(f"[+] Starting classic iperf client in ns_s (port {PORT_CLASSIC}, TCP, t={run_duration})...")
             return subprocess.Popen([
                 "sudo", "ip", "netns", "exec", NS_SENDER,
-                "iperf3", "-c", DST_IP, "-p", str(PORT_CLASSIC), "-t", str(run_duration)
+                "iperf", "-c", DST_IP, "-p", str(PORT_CLASSIC), "-t", str(run_duration)
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             bw_args = ["-b", classic_bw] if classic_bw else []
-            print(f"[+] Starting classic iperf3 client in ns_s (port {PORT_CLASSIC}, UDP, t={run_duration}, bw={classic_bw or 'default'})...")
+            print(f"[+] Starting classic iperf client in ns_s (port {PORT_CLASSIC}, UDP, t={run_duration}, bw={classic_bw or 'default'})...")
             return subprocess.Popen([
                 "sudo", "ip", "netns", "exec", NS_SENDER,
-                "iperf3", "-c", DST_IP, "-p", str(PORT_CLASSIC), "-u", "-t", str(run_duration), *bw_args
+                "iperf", "-c", DST_IP, "-p", str(PORT_CLASSIC), "-u", "-t", str(run_duration), *bw_args
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     if flows == 'l4s':
@@ -196,23 +202,33 @@ def parse_ss(output):
 
 
 def parse_tc(output):
-    """Extract DualPI2 metrics from `tc -s qdisc show` output."""
-    metrics = {}
-    # alpha, beta, prob are floating fields
-    for f in ["alpha", "beta", "prob"]:
-        m = re.search(rf"\b{f}\s+([\d\.eE+-]+)", output)
-        metrics[f] = float(m.group(1)) if m else None
+    """Extract DualPI2 metrics from `tc -s qdisc show` output.
 
-    # delays are reported like: delay_c 5277us or delay_l 0us
-    def _parse_delay(field_name):
-        # match digits possibly followed by unit letters (e.g., '5277us' or '5ms')
-        m = re.search(rf"\b{field_name}\s+([\d\.]+)([a-zA-Z]+)?", output)
+    Strategy:
+    - Prefer parsing strictly within the dualpi2 block to avoid accidental matches.
+    - If the dualpi2 block cannot be found or fields are missing, fall back to a
+      broader search across the full output for robustness.
+    """
+    metrics = {}
+
+    # Try to scope to the dualpi2 block first
+    block_m = re.search(r"(qdisc\s+dualpi2\b.*?)(?:\nqdisc|\Z)", output, re.S | re.I)
+    block = block_m.group(1) if block_m else None
+
+    def get_float(field, src):
+        m = re.search(rf"\b{field}\s+([\d\.eE+-]+)", src)
+        return float(m.group(1)) if m else None
+
+    def get_int(field, src):
+        m = re.search(rf"\b{field}\s+(\d+)", src)
+        return int(m.group(1)) if m else None
+
+    def _parse_delay(field_name, src):
+        m = re.search(rf"\b{field_name}\s+([\d\.]+)([a-zA-Z]+)?", src)
         if not m:
             return None
         val = float(m.group(1))
-        unit = m.group(2) or "us"
-        unit = unit.lower()
-        # normalize to microseconds
+        unit = (m.group(2) or "us").lower()
         if unit == 'us':
             return val
         if unit == 'ms':
@@ -221,36 +237,57 @@ def parse_tc(output):
             return val * 1e6
         if unit == 'ns':
             return val / 1000.0
-        # fallback: return raw value
         return val
 
-    metrics['delay_C'] = _parse_delay('delay_c')
-    metrics['delay_L'] = _parse_delay('delay_l')
-
-    # credit may be negative and may include trailing text like '(L)'
-    m = re.search(r"\bcredit\s+(-?\d+)", output)
-    metrics['credit'] = int(m.group(1)) if m else None
-
-    # other integer fields (base counters)
+    src_primary = block if block is not None else output
+    # Parse floats
+    for f in ["alpha", "beta", "prob"]:
+        metrics[f] = get_float(f, src_primary)
+    # Delays
+    metrics['delay_C'] = _parse_delay('delay_c', src_primary)
+    metrics['delay_L'] = _parse_delay('delay_l', src_primary)
+    # Credit and counters
+    metrics['credit'] = get_int('credit', src_primary)
     for f in ['ecn_mark', 'pkts_in_c', 'pkts_in_l', 'step_marks', 'dq_count', 'eq_count']:
-        m = re.search(rf"\b{f}\s+(\d+)", output)
-        metrics[f] = int(m.group(1)) if m else None
-    # optional per-queue PI2 ECN mark counters appended in extended xstats
+        metrics[f] = get_int(f, src_primary)
     for f in ['c_marks', 'l_marks']:
-        m = re.search(rf"\b{f}\s+(\d+)", output)
-        metrics[f] = int(m.group(1)) if m else None
+        metrics[f] = get_int(f, src_primary)
+    # New drop counters
+    for f in ['c_drops', 'l_drops']:
+        metrics[f] = get_int(f, src_primary)
 
-    # Extract backlog for the DualPI2 block specifically (bytes and packets)
-    # Matches the dualpi2 section up to the next qdisc block or end of string
-    block = re.search(r"(qdisc\s+dualpi2.*?)(?:\nqdisc|\Z)", output, re.S | re.I)
-    if block:
-        b = re.search(r"backlog\s+(\d+)b\s+(\d+)p", block.group(1))
-        if b:
-            metrics['backlog_bytes'] = int(b.group(1))
-            metrics['backlog_packets'] = int(b.group(2))
+    # Backlog: only meaningful within dualpi2 block; try primary then fallback
+    backlog_src = block if block is not None else output
+    b = re.search(r"backlog\s+(\d+)b\s+(\d+)p", backlog_src)
+    if b:
+        metrics['backlog_bytes'] = int(b.group(1))
+        metrics['backlog_packets'] = int(b.group(2))
+
+    # Fallback: if many keys are still None, try broad search on full output
+    if block is not None:
+        missing_keys = [k for k in ["alpha","beta","prob","delay_C","delay_L","credit",
+                                    "ecn_mark","pkts_in_c","pkts_in_l","step_marks",
+                                    "dq_count","eq_count","c_marks","l_marks","c_drops","l_drops"]
+                        if metrics.get(k) is None]
+        if missing_keys:
+            for f in ["alpha", "beta", "prob"]:
+                if metrics.get(f) is None:
+                    metrics[f] = get_float(f, output)
+            # delays
+            if metrics.get('delay_C') is None:
+                metrics['delay_C'] = _parse_delay('delay_c', output)
+            if metrics.get('delay_L') is None:
+                metrics['delay_L'] = _parse_delay('delay_l', output)
+            # ints
+            for f in ['credit','ecn_mark','pkts_in_c','pkts_in_l','step_marks','dq_count','eq_count','c_marks','l_marks','c_drops','l_drops']:
+                if metrics.get(f) is None:
+                    metrics[f] = get_int(f, output)
 
     return metrics
 
+
+_warned_tc_empty = False
+_warned_no_dualpi2 = False
 
 def capture_metrics():
     """Run ss and tc commands, parse metrics."""
@@ -263,6 +300,13 @@ def capture_metrics():
     ss_out = ss_proc.stdout
     tc_proc = subprocess.run(tc_cmd_list, capture_output=True, text=True)
     tc_out = tc_proc.stdout
+    global _warned_tc_empty, _warned_no_dualpi2
+    if not _warned_tc_empty and (tc_out is None or not tc_out.strip()):
+        print("[!] Warning: tc output is empty. Check TC_PATH and permissions.")
+        _warned_tc_empty = True
+    elif not _warned_no_dualpi2 and 'dualpi2' not in tc_out:
+        print("[!] Warning: dualpi2 qdisc not found in tc output. Is it attached on", VETH_DEVICE, "?")
+        _warned_no_dualpi2 = True
     t1 = time.time_ns()
 
     # Use midpoint as the best estimate of when the snapshot represents
@@ -278,9 +322,9 @@ def capture_metrics():
     return data
 
 
-
 def main():
-    parser = argparse.ArgumentParser(description="DualPI2 metrics collection")
+    global TC_PATH
+    parser = argparse.ArgumentParser(description="DualPI2 metrics collection (iperf2)")
     parser.add_argument('--flows', choices=['both', 'l4s', 'classic'], default='both', help='Which flows to run (default: both)')
     parser.add_argument('-T', '--classic-tcp', action='store_true', help='Use TCP for the classic flow (default: UDP)')
     parser.add_argument('--outdir',
@@ -293,7 +337,9 @@ def main():
     parser.add_argument('--debug-samples', type=int, default=0,
                         help='Print debug info for first N samples (0=disabled)')
     parser.add_argument('--classic-bw', default='12M',
-                        help='Classic UDP bandwidth for iperf3 (e.g., 12M, 20M). TCP classic ignores this.')
+                        help='Classic UDP bandwidth for iperf (e.g., 12M, 20M). TCP classic ignores this.')
+    parser.add_argument('--tc-path', default=TC_PATH,
+                        help='Path to tc binary (override if needed). Default: %(default)s')
     args = parser.parse_args()
     flows = args.flows
     classic_tcp = args.classic_tcp
@@ -306,36 +352,62 @@ def main():
     if start_delay_arg > 0.0 or flow_order_arg != 'l4s-first':
         print("[i] Forcing simultaneous start: ignoring --start-delay/--flow-order")
     classic_bw = args.classic_bw
+    # Allow overriding tc binary path
+    if args.tc_path and args.tc_path != TC_PATH:
+        TC_PATH = args.tc_path
+        print(f"[i] Using tc binary at: {TC_PATH}")
 
     # Reset qdisc counters to start clean each run
     try:
         print("[i] Resetting DualPI2 qdisc via re_init_qdisc.sh...")
-        subprocess.run(
-            ["/bin/bash", "/home/aneesh/moment_lab/Scripts/re_init_qdisc.sh"],
-            check=True
-        )
+        subprocess.run([
+            "/bin/bash", "/home/aneesh/moment_lab/Scripts/re_init_qdisc.sh"
+        ], check=True)
     except subprocess.CalledProcessError as e:
         print(f"[!] re_init_qdisc.sh failed: {e}. Continuing.")
     except Exception as e:
         print(f"[!] Failed to reset qdisc: {e}. Continuing.")
 
-    # Ensure outdir exists
+    # Ensure base output dir exists
     os.makedirs(outdir, exist_ok=True)
-    print(f"[i] Output directory: {outdir}")
+    print(f"[i] Base output directory: {outdir}")
 
-    # Build base filename prefix and full CSV path
+    # Build run-specific directory based on tool and flow kind
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     base_prefix = f"dualpi2_metrics_{timestamp}"
-    outfile = os.path.join(outdir, base_prefix + '.csv')
+    flow_tag = 'classic+l4s' if flows == 'both' else ('l4s' if flows == 'l4s' else 'classic')
+    run_dir_name = f"{TOOL_NAME}_{flow_tag}_{timestamp}"
+    run_dir = os.path.join(outdir, run_dir_name)
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"[i] Run directory: {run_dir}")
+
+    # Full CSV path inside the run directory
+    outfile = os.path.join(run_dir, base_prefix + '.csv')
 
     # Startup summary
     l4s_desc = f"TCP (CC={CC_ALGO})"
     classic_desc = ("TCP" if classic_tcp else f"UDP (bw={classic_bw})")
     print(f"[i] L4S flow: {l4s_desc} | Classic flow: {classic_desc} | Flows: {flows}")
 
-    # Start iperf3 servers
+    # Ensure no stale servers block ports
+    kill_existing_servers()
+    # Start iperf servers
     server_procs = start_iperf_servers(flows)
     time.sleep(1)
+    # Verify servers are listening
+    try:
+        out = subprocess.run([
+            "sudo", "ip", "netns", "exec", NS_RECEIVER, "ss", "-lntp"
+        ], capture_output=True, text=True).stdout
+        missing = []
+        if flows in ('both','l4s') and f":{PORT_L4S}" not in out:
+            missing.append(PORT_L4S)
+        if flows in ('both','classic') and f":{PORT_CLASSIC}" not in out:
+            missing.append(PORT_CLASSIC)
+        if missing:
+            print(f"[!] Warning: iperf server not detected listening on ports: {missing}. Ensure no conflicts and that servers started.")
+    except Exception:
+        pass
 
     # Prepare CSV (append metadata columns for flow ordering and start timestamps)
     fields = [
@@ -343,7 +415,7 @@ def main():
         "rtt", "pacing_rate", "delivery_rate", "cwnd",
         "bytes_acked", "bytes_sent", "alpha", "beta", "prob",
         "delay_C", "delay_L", "credit", "ecn_mark", "step_marks", "pkts_in_c", "pkts_in_l",
-        "c_marks", "l_marks",  # optional extended counters
+        "c_marks", "l_marks", "c_drops", "l_drops",  # extended counters incl. drops
         "dq_count", "eq_count",  # raw enqueue/dequeue counters
         "dq_delta", "eq_delta",  # per-sample differences
         "backlog_bytes", "backlog_packets",  # instantaneous backlog from dualpi2 block
@@ -353,7 +425,7 @@ def main():
     writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
     writer.writeheader()
 
-    # Start iperf3 clients using refactored function
+    # Start iperf clients
     client_procs, l4s_start_ts_ns, classic_start_ts_ns = start_iperf_clients(
         flows, classic_tcp, start_delay=start_delay, flow_order=flow_order, classic_bw=classic_bw
     )
@@ -378,7 +450,6 @@ def main():
         epoch_ref_ns = time.time_ns()
         sample_index = 0
         next_sample_ns = start_monotonic_ns
-
 
         # Initialize previous counters for delta computation
         prev_dq = None
@@ -441,7 +512,7 @@ def main():
         for p in client_procs:
             p.send_signal(signal.SIGINT)
     finally:
-        # Stop iperf3 servers
+        # Stop iperf servers
         for p in server_procs:
             p.terminate()
         f.close()
@@ -473,7 +544,7 @@ def main():
                 plt.title('Delays and RTT over time')
                 plt.legend()
                 plt.grid(True)
-                png = os.path.join(outdir, base_prefix + '_delays_rtt.png')
+                png = os.path.join(run_dir, base_prefix + '_delays_rtt.png')
                 plt.tight_layout()
                 plt.savefig(png)
                 plt.close()
@@ -487,7 +558,7 @@ def main():
                 plt.title('Credit over time')
                 plt.legend()
                 plt.grid(True)
-                png = os.path.join(outdir, base_prefix + '_credit.png')
+                png = os.path.join(run_dir, base_prefix + '_credit.png')
                 plt.tight_layout()
                 plt.savefig(png)
                 plt.close()
@@ -501,12 +572,12 @@ def main():
                 plt.title('Probability over time')
                 plt.legend()
                 plt.grid(True)
-                png = os.path.join(outdir, base_prefix + '_probability.png')
+                png = os.path.join(run_dir, base_prefix + '_probability.png')
                 plt.tight_layout()
                 plt.savefig(png)
                 plt.close()
                 print(f"[+] Plot written to {png}")
-            # Plot mark counters together (any present among ecn_mark, step_marks, c_marks, l_marks)
+            # Plot marks/counters (exclude drops)
             mark_cols = [c for c in ['ecn_mark', 'step_marks', 'c_marks', 'l_marks'] if c in df.columns]
             if mark_cols:
                 plt.figure(figsize=(12, 4))
@@ -520,10 +591,31 @@ def main():
                     plt.plot(df.index, df[col], label=col, color=color_map.get(col))
                 plt.xlabel('time')
                 plt.ylabel('count')
-                plt.title('Mark Counters over time')
+                plt.title('Marks counters over time')
                 plt.legend()
                 plt.grid(True)
-                png = os.path.join(outdir, base_prefix + '_marks.png')
+                png = os.path.join(run_dir, base_prefix + '_counters.png')
+                plt.tight_layout()
+                plt.savefig(png)
+                plt.close()
+                print(f"[+] Plot written to {png}")
+
+            # Plot drops separately
+            drop_cols = [c for c in ['c_drops', 'l_drops'] if c in df.columns]
+            if drop_cols:
+                plt.figure(figsize=(12, 4))
+                drop_color_map = {
+                    'c_drops': 'tab:pink',
+                    'l_drops': 'tab:red'
+                }
+                for col in drop_cols:
+                    plt.plot(df.index, df[col], label=col, color=drop_color_map.get(col))
+                plt.xlabel('time')
+                plt.ylabel('count')
+                plt.title('Drop counters over time')
+                plt.legend()
+                plt.grid(True)
+                png = os.path.join(run_dir, base_prefix + '_drops.png')
                 plt.tight_layout()
                 plt.savefig(png)
                 plt.close()
@@ -538,7 +630,7 @@ def main():
                 plt.title('Queue Backlog (packets) over time')
                 plt.legend()
                 plt.grid(True)
-                png = os.path.join(outdir, base_prefix + '_queue_backlog.png')
+                png = os.path.join(run_dir, base_prefix + '_queue_backlog.png')
                 plt.tight_layout()
                 plt.savefig(png)
                 plt.close()
@@ -560,7 +652,7 @@ def main():
                 plt.ylabel('count')
                 plt.title('Enqueue / Dequeue Raw Counters')
                 plt.legend(); plt.grid(True)
-                png = os.path.join(outdir, base_prefix + '_enqueue_dequeue_raw.png')
+                png = os.path.join(run_dir, base_prefix + '_enqueue_dequeue_raw.png')
                 plt.tight_layout(); plt.savefig(png); plt.close()
                 print(f"[+] Plot written to {png}")
 
@@ -575,13 +667,11 @@ def main():
                 plt.ylabel('packets per sample')
                 plt.title('Enqueue / Dequeue Per-Sample Deltas')
                 plt.legend(); plt.grid(True)
-                png = os.path.join(outdir, base_prefix + '_enqueue_dequeue_delta.png')
+                png = os.path.join(run_dir, base_prefix + '_enqueue_dequeue_delta.png')
                 plt.tight_layout(); plt.savefig(png); plt.close()
                 print(f"[+] Plot written to {png}")
         except Exception as e:
             print(f"[!] Additional enqueue/dequeue plot generation failed: {e}")
-
-
 
 
 if __name__ == "__main__":

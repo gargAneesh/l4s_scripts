@@ -62,6 +62,7 @@ import signal
 from datetime import datetime
 import os
 import argparse
+from typing import Optional
 
 # optional plotting libs
 try:
@@ -78,11 +79,12 @@ VETH_DEVICE = "veth-s"         # egress interface with DualPI2
 DST_IP = "172.20.1.2"          # receiver IP
 NS_SENDER = "ns_s"
 NS_RECEIVER = "ns_r"
-TC_PATH = "your-directory/iproute2/tc/tc"       # adjust if needed
+TC_PATH = "/home/aneesh/moment_lab/iproute2/tc/tc"       # adjust if needed; can be overridden via --tc-path
 DURATION = 60                  # iperf3 run time in seconds
 CC_ALGO = "prague"             # congestion control algorithm
 PORT_L4S = 5201
 PORT_CLASSIC = 5202
+TOOL_NAME = "iperf3"           # used for naming per-run output directory
 # OUTFILE will be constructed dynamically based on --outdir
 # You can override the default output directory via:
 #   1) CLI: --outdir /desired/path
@@ -96,20 +98,34 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, shell=True, capture_output=True, text=True, **kwargs).stdout
 
 
+def kill_existing_servers():
+    """Best-effort kill of any existing iperf/iperf3 servers in receiver namespace.
+
+    Prevents port binding conflicts that cause silent server startup failures.
+    """
+    for bin_name in ("iperf3", "iperf"):
+        try:
+            subprocess.run(["sudo", "ip", "netns", "exec", NS_RECEIVER, "pkill", "-x", bin_name],
+                           capture_output=True)
+        except Exception:
+            pass
+
 
 def start_iperf_servers(flows):
     """Start iperf3 servers for selected flows (in ns_r)."""
     procs = []
     if flows in ('both', 'l4s'):
         print("[+] Starting L4S iperf3 server in ns_r (port 5201)...")
-        procs.append(subprocess.Popen([
+        p = subprocess.Popen([
             "sudo", "ip", "netns", "exec", NS_RECEIVER, "iperf3", "-s", "-p", str(PORT_L4S)
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        procs.append(p)
     if flows in ('both', 'classic'):
         print("[+] Starting classic iperf3 server in ns_r (port 5202)...")
-        procs.append(subprocess.Popen([
+        p = subprocess.Popen([
             "sudo", "ip", "netns", "exec", NS_RECEIVER, "iperf3", "-s", "-p", str(PORT_CLASSIC)
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        procs.append(p)
     return procs
 
 def start_iperf_clients(flows,
@@ -117,7 +133,7 @@ def start_iperf_clients(flows,
                         start_delay: float = 0.0,
                         flow_order: str = 'l4s-first',
                         base_duration: int = DURATION,
-                        classic_bw: str | None = None):
+                        classic_bw: Optional[str] = None):
     """Start iperf3 client flows in the sender namespace.
 
     Behavior:
@@ -196,23 +212,33 @@ def parse_ss(output):
 
 
 def parse_tc(output):
-    """Extract DualPI2 metrics from `tc -s qdisc show` output."""
-    metrics = {}
-    # alpha, beta, prob are floating fields
-    for f in ["alpha", "beta", "prob"]:
-        m = re.search(rf"\b{f}\s+([\d\.eE+-]+)", output)
-        metrics[f] = float(m.group(1)) if m else None
+    """Extract DualPI2 metrics from `tc -s qdisc show` output.
 
-    # delays are reported like: delay_c 5277us or delay_l 0us
-    def _parse_delay(field_name):
-        # match digits possibly followed by unit letters (e.g., '5277us' or '5ms')
-        m = re.search(rf"\b{field_name}\s+([\d\.]+)([a-zA-Z]+)?", output)
+    Strategy:
+    - Prefer parsing strictly within the dualpi2 block to avoid accidental matches.
+    - If the dualpi2 block cannot be found or fields are missing, fall back to a
+      broader search across the full output for robustness.
+    """
+    metrics = {}
+
+    # Try to scope to the dualpi2 block first
+    block_m = re.search(r"(qdisc\s+dualpi2\b.*?)(?:\nqdisc|\Z)", output, re.S | re.I)
+    block = block_m.group(1) if block_m else None
+
+    def get_float(field, src):
+        m = re.search(rf"\b{field}\s+([\d\.eE+-]+)", src)
+        return float(m.group(1)) if m else None
+
+    def get_int(field, src):
+        m = re.search(rf"\b{field}\s+(\d+)", src)
+        return int(m.group(1)) if m else None
+
+    def _parse_delay(field_name, src):
+        m = re.search(rf"\b{field_name}\s+([\d\.]+)([a-zA-Z]+)?", src)
         if not m:
             return None
         val = float(m.group(1))
-        unit = m.group(2) or "us"
-        unit = unit.lower()
-        # normalize to microseconds
+        unit = (m.group(2) or "us").lower()
         if unit == 'us':
             return val
         if unit == 'ms':
@@ -221,36 +247,57 @@ def parse_tc(output):
             return val * 1e6
         if unit == 'ns':
             return val / 1000.0
-        # fallback: return raw value
         return val
 
-    metrics['delay_C'] = _parse_delay('delay_c')
-    metrics['delay_L'] = _parse_delay('delay_l')
-
-    # credit may be negative and may include trailing text like '(L)'
-    m = re.search(r"\bcredit\s+(-?\d+)", output)
-    metrics['credit'] = int(m.group(1)) if m else None
-
-    # other integer fields (base counters)
+    src_primary = block if block is not None else output
+    # Parse floats
+    for f in ["alpha", "beta", "prob"]:
+        metrics[f] = get_float(f, src_primary)
+    # Delays
+    metrics['delay_C'] = _parse_delay('delay_c', src_primary)
+    metrics['delay_L'] = _parse_delay('delay_l', src_primary)
+    # Credit and counters
+    metrics['credit'] = get_int('credit', src_primary)
     for f in ['ecn_mark', 'pkts_in_c', 'pkts_in_l', 'step_marks', 'dq_count', 'eq_count']:
-        m = re.search(rf"\b{f}\s+(\d+)", output)
-        metrics[f] = int(m.group(1)) if m else None
-    # optional per-queue PI2 ECN mark counters appended in extended xstats
+        metrics[f] = get_int(f, src_primary)
     for f in ['c_marks', 'l_marks']:
-        m = re.search(rf"\b{f}\s+(\d+)", output)
-        metrics[f] = int(m.group(1)) if m else None
+        metrics[f] = get_int(f, src_primary)
+    # New drop counters
+    for f in ['c_drops', 'l_drops']:
+        metrics[f] = get_int(f, src_primary)
 
-    # Extract backlog for the DualPI2 block specifically (bytes and packets)
-    # Matches the dualpi2 section up to the next qdisc block or end of string
-    block = re.search(r"(qdisc\s+dualpi2.*?)(?:\nqdisc|\Z)", output, re.S | re.I)
-    if block:
-        b = re.search(r"backlog\s+(\d+)b\s+(\d+)p", block.group(1))
-        if b:
-            metrics['backlog_bytes'] = int(b.group(1))
-            metrics['backlog_packets'] = int(b.group(2))
+    # Backlog: only meaningful within dualpi2 block; try primary then fallback
+    backlog_src = block if block is not None else output
+    b = re.search(r"backlog\s+(\d+)b\s+(\d+)p", backlog_src)
+    if b:
+        metrics['backlog_bytes'] = int(b.group(1))
+        metrics['backlog_packets'] = int(b.group(2))
+
+    # Fallback: if many keys are still None, try broad search on full output
+    if block is not None:
+        missing_keys = [k for k in ["alpha","beta","prob","delay_C","delay_L","credit",
+                        "ecn_mark","pkts_in_c","pkts_in_l","step_marks",
+                        "dq_count","eq_count","c_marks","l_marks","c_drops","l_drops"]
+                        if metrics.get(k) is None]
+        if missing_keys:
+            for f in ["alpha", "beta", "prob"]:
+                if metrics.get(f) is None:
+                    metrics[f] = get_float(f, output)
+            # delays
+            if metrics.get('delay_C') is None:
+                metrics['delay_C'] = _parse_delay('delay_c', output)
+            if metrics.get('delay_L') is None:
+                metrics['delay_L'] = _parse_delay('delay_l', output)
+            # ints
+            for f in ['credit','ecn_mark','pkts_in_c','pkts_in_l','step_marks','dq_count','eq_count','c_marks','l_marks','c_drops','l_drops']:
+                if metrics.get(f) is None:
+                    metrics[f] = get_int(f, output)
 
     return metrics
 
+
+_warned_tc_empty = False
+_warned_no_dualpi2 = False
 
 def capture_metrics():
     """Run ss and tc commands, parse metrics."""
@@ -263,6 +310,13 @@ def capture_metrics():
     ss_out = ss_proc.stdout
     tc_proc = subprocess.run(tc_cmd_list, capture_output=True, text=True)
     tc_out = tc_proc.stdout
+    global _warned_tc_empty, _warned_no_dualpi2
+    if not _warned_tc_empty and (tc_out is None or not tc_out.strip()):
+        print("[!] Warning: tc output is empty. Check TC_PATH and permissions.")
+        _warned_tc_empty = True
+    elif not _warned_no_dualpi2 and 'dualpi2' not in tc_out:
+        print("[!] Warning: dualpi2 qdisc not found in tc output. Is it attached on", VETH_DEVICE, "?")
+        _warned_no_dualpi2 = True
     t1 = time.time_ns()
 
     # Use midpoint as the best estimate of when the snapshot represents
@@ -280,6 +334,7 @@ def capture_metrics():
 
 
 def main():
+    global TC_PATH
     parser = argparse.ArgumentParser(description="DualPI2 metrics collection")
     parser.add_argument('--flows', choices=['both', 'l4s', 'classic'], default='both', help='Which flows to run (default: both)')
     parser.add_argument('-T', '--classic-tcp', action='store_true', help='Use TCP for the classic flow (default: UDP)')
@@ -294,6 +349,8 @@ def main():
                         help='Print debug info for first N samples (0=disabled)')
     parser.add_argument('--classic-bw', default='12M',
                         help='Classic UDP bandwidth for iperf3 (e.g., 12M, 20M). TCP classic ignores this.')
+    parser.add_argument('--tc-path', default=TC_PATH,
+                        help='Path to tc binary (override if needed). Default: %(default)s')
     args = parser.parse_args()
     flows = args.flows
     classic_tcp = args.classic_tcp
@@ -306,6 +363,10 @@ def main():
     if start_delay_arg > 0.0 or flow_order_arg != 'l4s-first':
         print("[i] Forcing simultaneous start: ignoring --start-delay/--flow-order")
     classic_bw = args.classic_bw
+    # Allow overriding tc binary path
+    if args.tc_path and args.tc_path != TC_PATH:
+        TC_PATH = args.tc_path
+        print(f"[i] Using tc binary at: {TC_PATH}")
 
     # Reset qdisc counters to start clean each run
     try:
@@ -319,23 +380,46 @@ def main():
     except Exception as e:
         print(f"[!] Failed to reset qdisc: {e}. Continuing.")
 
-    # Ensure outdir exists
+    # Ensure base output dir exists
     os.makedirs(outdir, exist_ok=True)
-    print(f"[i] Output directory: {outdir}")
+    print(f"[i] Base output directory: {outdir}")
 
-    # Build base filename prefix and full CSV path
+    # Build run-specific directory based on tool and flow kind
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     base_prefix = f"dualpi2_metrics_{timestamp}"
-    outfile = os.path.join(outdir, base_prefix + '.csv')
+    flow_tag = 'classic+l4s' if flows == 'both' else ('l4s' if flows == 'l4s' else 'classic')
+    run_dir_name = f"{TOOL_NAME}_{flow_tag}_{timestamp}"
+    run_dir = os.path.join(outdir, run_dir_name)
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"[i] Run directory: {run_dir}")
+
+    # Full CSV path inside the run directory
+    outfile = os.path.join(run_dir, base_prefix + '.csv')
 
     # Startup summary
     l4s_desc = f"TCP (CC={CC_ALGO})"
     classic_desc = ("TCP" if classic_tcp else f"UDP (bw={classic_bw})")
     print(f"[i] L4S flow: {l4s_desc} | Classic flow: {classic_desc} | Flows: {flows}")
 
+    # Ensure no stale servers block ports
+    kill_existing_servers()
     # Start iperf3 servers
     server_procs = start_iperf_servers(flows)
     time.sleep(1)
+    # Verify servers are listening
+    try:
+        out = subprocess.run([
+            "sudo", "ip", "netns", "exec", NS_RECEIVER, "ss", "-lntp"
+        ], capture_output=True, text=True).stdout
+        missing = []
+        if flows in ('both','l4s') and f":{PORT_L4S}" not in out:
+            missing.append(PORT_L4S)
+        if flows in ('both','classic') and f":{PORT_CLASSIC}" not in out:
+            missing.append(PORT_CLASSIC)
+        if missing:
+            print(f"[!] Warning: iperf3 server not detected listening on ports: {missing}. Ensure no conflicts and that servers started.")
+    except Exception:
+        pass
 
     # Prepare CSV (append metadata columns for flow ordering and start timestamps)
     fields = [
@@ -343,7 +427,7 @@ def main():
         "rtt", "pacing_rate", "delivery_rate", "cwnd",
         "bytes_acked", "bytes_sent", "alpha", "beta", "prob",
         "delay_C", "delay_L", "credit", "ecn_mark", "step_marks", "pkts_in_c", "pkts_in_l",
-        "c_marks", "l_marks",  # optional extended counters
+        "c_marks", "l_marks", "c_drops", "l_drops",  # extended counters including drops
         "dq_count", "eq_count",  # raw enqueue/dequeue counters
         "dq_delta", "eq_delta",  # per-sample differences
         "backlog_bytes", "backlog_packets",  # instantaneous backlog from dualpi2 block
@@ -473,7 +557,7 @@ def main():
                 plt.title('Delays and RTT over time')
                 plt.legend()
                 plt.grid(True)
-                png = os.path.join(outdir, base_prefix + '_delays_rtt.png')
+                png = os.path.join(run_dir, base_prefix + '_delays_rtt.png')
                 plt.tight_layout()
                 plt.savefig(png)
                 plt.close()
@@ -487,7 +571,7 @@ def main():
                 plt.title('Credit over time')
                 plt.legend()
                 plt.grid(True)
-                png = os.path.join(outdir, base_prefix + '_credit.png')
+                png = os.path.join(run_dir, base_prefix + '_credit.png')
                 plt.tight_layout()
                 plt.savefig(png)
                 plt.close()
@@ -501,12 +585,12 @@ def main():
                 plt.title('Probability over time')
                 plt.legend()
                 plt.grid(True)
-                png = os.path.join(outdir, base_prefix + '_probability.png')
+                png = os.path.join(run_dir, base_prefix + '_probability.png')
                 plt.tight_layout()
                 plt.savefig(png)
                 plt.close()
                 print(f"[+] Plot written to {png}")
-            # Plot mark counters together (any present among ecn_mark, step_marks, c_marks, l_marks)
+            # Plot marks/counters (exclude drops)
             mark_cols = [c for c in ['ecn_mark', 'step_marks', 'c_marks', 'l_marks'] if c in df.columns]
             if mark_cols:
                 plt.figure(figsize=(12, 4))
@@ -520,10 +604,31 @@ def main():
                     plt.plot(df.index, df[col], label=col, color=color_map.get(col))
                 plt.xlabel('time')
                 plt.ylabel('count')
-                plt.title('Mark Counters over time')
+                plt.title('Marks counters over time')
                 plt.legend()
                 plt.grid(True)
-                png = os.path.join(outdir, base_prefix + '_marks.png')
+                png = os.path.join(run_dir, base_prefix + '_marks.png')
+                plt.tight_layout()
+                plt.savefig(png)
+                plt.close()
+                print(f"[+] Plot written to {png}")
+
+            # Plot drops separately
+            drop_cols = [c for c in ['c_drops', 'l_drops'] if c in df.columns]
+            if drop_cols:
+                plt.figure(figsize=(12, 4))
+                drop_color_map = {
+                    'c_drops': 'tab:pink',
+                    'l_drops': 'tab:red'
+                }
+                for col in drop_cols:
+                    plt.plot(df.index, df[col], label=col, color=drop_color_map.get(col))
+                plt.xlabel('time')
+                plt.ylabel('count')
+                plt.title('Drop counters over time')
+                plt.legend()
+                plt.grid(True)
+                png = os.path.join(run_dir, base_prefix + '_drops.png')
                 plt.tight_layout()
                 plt.savefig(png)
                 plt.close()
@@ -538,7 +643,7 @@ def main():
                 plt.title('Queue Backlog (packets) over time')
                 plt.legend()
                 plt.grid(True)
-                png = os.path.join(outdir, base_prefix + '_queue_backlog.png')
+                png = os.path.join(run_dir, base_prefix + '_queue_backlog.png')
                 plt.tight_layout()
                 plt.savefig(png)
                 plt.close()
@@ -560,7 +665,7 @@ def main():
                 plt.ylabel('count')
                 plt.title('Enqueue / Dequeue Raw Counters')
                 plt.legend(); plt.grid(True)
-                png = os.path.join(outdir, base_prefix + '_enqueue_dequeue_raw.png')
+                png = os.path.join(run_dir, base_prefix + '_enqueue_dequeue_raw.png')
                 plt.tight_layout(); plt.savefig(png); plt.close()
                 print(f"[+] Plot written to {png}")
 
@@ -575,7 +680,7 @@ def main():
                 plt.ylabel('packets per sample')
                 plt.title('Enqueue / Dequeue Per-Sample Deltas')
                 plt.legend(); plt.grid(True)
-                png = os.path.join(outdir, base_prefix + '_enqueue_dequeue_delta.png')
+                png = os.path.join(run_dir, base_prefix + '_enqueue_dequeue_delta.png')
                 plt.tight_layout(); plt.savefig(png); plt.close()
                 print(f"[+] Plot written to {png}")
         except Exception as e:
