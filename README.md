@@ -1,112 +1,137 @@
-# DualPI2 Metrics Collection Tool
+# Rebuild + Load DualPI2 and Setup Namespaces
 
-Automates collection and plotting of DualPI2 qdisc and TCP metrics from Linux network namespaces using `iperf3`, `ss`, and `tc`.
+This guide explains what `l4s_scripts/rebuild_dualpi2.sh` does, how to configure it, and how to verify everything is working. It assumes you cloned this repo as-is (so `re_init_qdisc.sh` is in the repo root and this script is in `l4s_scripts/`).
 
-## Features
-- Run L4S (TCP Prague) and/or classic (UDP or TCP) flows.
-- Staggered flow start with configurable delay and order.
-- Periodic sampling (`ss -tin`, `tc -s qdisc show`) with high-resolution timestamps.
-- CSV logging of qdisc + TCP metrics, including per-sample enqueue/dequeue deltas.
-- Automatic generation of plots (if `pandas` + `matplotlib` installed): delays/RTT, credit, probability, mark counters, enqueue/dequeue raw & delta.
+## What this script does
 
-## Requirements
-- Python 3
-- `iperf3`, `iproute2/tc`, `ss` utilities available and accessible in namespaces
-- Namespaces: sender `ns_s`, receiver `ns_r`, and veth device with DualPI2 (`veth-s` by default)
-- Optional: `pandas`, `matplotlib` for plotting
+1. Removes any leftover namespaces from prior runs. This script creates and uses the namespaces `ns_s` and `ns_r`; do not manually create namespaces with these names to avoid collisions during setup.
+2. Unloads any currently loaded `sch_dualpi2` kernel module.
+3. Builds `sch_dualpi2.ko` from the custom Linux source tree that includes the DualPI2 modifications, such as mark and drop counters.
+4. Loads the freshly built module with `insmod` and ensures it is the active one. If a different copy is active, it copies your built module into the system modules directory and runs `depmod`.
+5. Creates two network namespaces (`ns_s`, `ns_r`) and a `veth` pair (`veth-s` ↔ `veth-r`).
+6. Assigns IPs, brings links up, and sets TCP to `prague` with ECN enabled in both namespaces.
+7. Calls `../re_init_qdisc.sh` to attach an HTB root qdisc and the DualPI2 leaf on `ns_s` egress (`veth-s`).
 
-## Configuration Defaults
-```
-INTERVAL = 0.5            # seconds between metric samples
-DURATION = 60             # iperf3 client duration per flow (seconds)
-VETH_DEVICE = "veth-s"
-DST_IP = "172.20.1.2"
-TC_PATH = "your-directory/iproute2/tc/tc"
-PORT_L4S = 5201
-PORT_CLASSIC = 5202
-CC_ALGO = "prague"
-```
-Output directory defaults to env `DUALPI2_OUTDIR` or `/home/aneesh/moment_lab/test_data`.
+## Why a custom Linux tree is required
 
-## CLI Usage
-```
-python3 dualpi2_metrics.py [--flows both|l4s|classic] [-T] \
-	[--start-delay SECONDS] [--flow-order l4s-first|classic-first] \
-	[--debug-samples N] [--outdir PATH]
-```
+This setup relies on a custom `DualPI2` qdisc that exposes additional counters/telemetry (e.g., probability, marks, delays). These changes do not alter the algorithm’s logic; they only add visibility. Because stock kernels typically lack these additions, you must build the module from a custom Linux source tree that includes the DualPI2 modifications and matches your running kernel. You can use our tree (https://github.com/gargAneesh/linux) or your own; set its path in `LINUX_PATH` inside `rebuild_dualpi2.sh`.
 
-### Flags
-- `--flows`: Which flows to run (`both` | `l4s` | `classic`). Default: `both`.
-- `-T, --classic-tcp`: Send classic flow over TCP instead of UDP.
-- `--start-delay`: Delay (seconds) between starting first and second client when `--flows both`. Default: `0.0` (simultaneous). Extends first flow duration so the overlap period after the second starts lasts `DURATION` seconds.
-- `--flow-order`: Which flow starts first when both run (`l4s-first` | `classic-first`). Default: `l4s-first`.
-- `--debug-samples`: Print parsed metric values for the first N samples (diagnostics). Default: `0` (disabled).
-- `--outdir`: Where to write CSV + plots.
+## Prerequisites
 
-### Examples
-Run both flows simultaneously (current default behavior):
-```
-python3 dualpi2_metrics.py --flows both
-```
-Start L4S, wait 2 seconds, then start classic (UDP):
-```
-python3 dualpi2_metrics.py --flows both --start-delay 2.0 --flow-order l4s-first
-```
-Start classic first (TCP), then L4S after 1.5s:
-```
-python3 dualpi2_metrics.py --flows both -T --start-delay 1.5 --flow-order classic-first
-```
-Classic only over TCP:
-```
-python3 dualpi2_metrics.py --flows classic -T
-```
-L4S only:
-```
-python3 dualpi2_metrics.py --flows l4s
+- A Linux source tree that includes your DualPI2 changes (see configuration below).
+- Build tools and headers appropriate for building the module (the tree at `LINUX_PATH` should be configured for your running kernel).
+- `sudo` privileges (the script uses namespaces, `insmod`, qdisc changes, etc.).
+- A `tc` binary that recognizes the `dualpi2` qdisc:
+  - In this repository, `re_init_qdisc.sh` references a custom `tc` built from https://github.com/gargAneesh/iproute2. Clone/build it and point `re_init_qdisc.sh` to the resulting `tc` binary on your device.
+  - This `tc` exposes the DualPI2 counters added to the kernel. Verify with:
+    `sudo ip netns exec ns_s <tc_path> -s qdisc show dev veth-s` and look for `c_marks`, `l_marks`, `c_drops`, `l_drops`.
+  - If your `tc` is installed elsewhere (or your system `tc` already supports DualPI2), simply update the path in `re_init_qdisc.sh` to match your environment.
+
+## Build tc (from our iproute2)
+
+If you clone our `iproute2` repo to get a DualPI2-aware `tc`, you need to build it once:
+
+```bash
+git clone https://github.com/gargAneesh/iproute2
+cd iproute2
+make -j"$(nproc)"
+# The tc binary will be at iproute2/tc/tc
 ```
 
-## CSV Output
-Each row contains metrics plus run metadata columns appended:
-- Timing: `timestamp`, `timestamp_ns`, `scheduled_timestamp_ns`, `sample_index`, `rel_ns`, `cmd_duration_ms`
-- TCP: `rtt`, `pacing_rate`, `delivery_rate`, `cwnd`, `bytes_acked`, `bytes_sent`
-- DualPI2: `alpha`, `beta`, `prob`, `delay_C`, `delay_L`, `credit`, `ecn_mark`, `step_marks`, `pkts_in_c`, `pkts_in_l`, `c_marks`, `l_marks`
-- Queue counters: `dq_count`, `eq_count` and per-sample deltas `dq_delta`, `eq_delta`
-- Run metadata: `start_delay`, `flow_order`, `l4s_start_ts_ns`, `classic_start_ts_ns`
+- Then set that path in `re_init_qdisc.sh` (e.g., `/path/to/iproute2/tc/tc`).
+- You do not need to build the entire Linux tree here; the `rebuild_dualpi2.sh` script builds just the `sch_dualpi2.ko` module from your custom Linux source.
+
+<!-- Dependencies (install before `make`):
+
+```bash
+# Ubuntu/Debian
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libelf-dev bison flex libmnl-dev
+
+# Fedora
+sudo dnf install -y gcc make pkgconf-pkg-config elfutils-libelf-devel bison flex libmnl-devel
+
+# Arch
+sudo pacman -S --needed base-devel pkgconf libelf bison flex libmnl
+``` -->
+
+## Configure
+
+Open `l4s_scripts/rebuild_dualpi2.sh` and set the path to your Linux source:
+
+```bash
+# Line near the top of the script
+LINUX_PATH=<path/to/linux>
+```
+
+- Set `LINUX_PATH` to the root of the Linux source tree that contains your DualPI2 qdisc changes.
+- Ensure `../re_init_qdisc.sh` exists relative to `l4s_scripts/` and, if needed, update the `tc` path inside it.
+
+## Run
+
+From anywhere (the script resolves paths internally):
+
+```bash
+cd l4s_scripts
+./rebuild_dualpi2.sh
+```
+
+The script will:
+- Delete namespaces if they already exist
+- Unload any loaded `sch_dualpi2`
+- Build and load your updated `sch_dualpi2.ko`
+- Set up `ns_s`, `ns_r`, the `veth` pair, IPs, and sysctls
+- Attach HTB + DualPI2 on `veth-s` in `ns_s`
+
+## Verify
+
+- Namespaces created:
+
+```bash
+ip netns ls
+```
+
+- Module is loaded and from the expected source:
+
+```bash
+lsmod | grep dualpi2
+modinfo sch_dualpi2 | grep filename
+```
+
+- Qdisc attached and reporting DualPI2 stats:
+
+```bash
+sudo ip netns exec ns_s <path/to/iproute2>/tc/tc -s qdisc show dev veth-s
+# If you changed tc path in re_init_qdisc.sh, use that path here too.
+```
+
+- TCP Prague & ECN settings in both namespaces:
+
+```bash
+sudo ip netns exec ns_s sysctl net.ipv4.tcp_congestion_control
+sudo ip netns exec ns_s sysctl net.ipv4.tcp_ecn
+sudo ip netns exec ns_r sysctl net.ipv4.tcp_congestion_control
+sudo ip netns exec ns_r sysctl net.ipv4.tcp_ecn
+```
+
+## Troubleshooting
+
+- "Module still loaded" error: remove any qdiscs using DualPI2, then re-run.
+- Build errors: ensure your `LINUX_PATH` is correct and the tree is configured to build modules for your running kernel.
+- `tc` errors like "Unknown qdisc": update `re_init_qdisc.sh` to point to a `tc` that includes DualPI2 support, or install one.
+- Permissions: the script requires `sudo`; if any step fails with EPERM, re-run with a user that can `sudo`.
+
+## Cleanup
+
+To tear down the topology and unload the module:
+
+```bash
+sudo ip netns del ns_s || true
+sudo ip netns del ns_r || true
+sudo rmmod sch_dualpi2 || true
+```
+
+---
 
 Notes:
-- `delay_C` and `delay_L` normalized to microseconds.
-- Deltas account for potential 32-bit wrap-around.
-- If a flow launches later (due to `--start-delay`), early samples may reflect single-flow dynamics.
-
-## Plots Generated
-(If libraries available)
-- `_delays_rtt.png`: `delay_C`, `delay_L`, `rtt`
-- `_credit.png`: `credit`
-- `_probability.png`: `prob`
-- `_marks.png`: mark counters (`ecn_mark`, `step_marks`, `c_marks`, `l_marks`)
-- `_enqueue_dequeue_raw.png`: `dq_count`, `eq_count`
-- `_enqueue_dequeue_delta.png`: `dq_delta`, `eq_delta`
-
-## Staggered Start & Duration Guarantee
-When `--flows both`:
-1. First client (chosen by `--flow-order`) starts immediately.
-2. If `--start-delay > 0`, the script waits that many seconds.
-3. Second client starts.
-4. First client's iperf run time is extended by `start_delay` seconds (integer truncated) to ensure at least `DURATION` seconds of overlap after the second flow starts.
-5. Sampling continues until: (all iperf clients have exited) AND (at least `DURATION` seconds have elapsed since the second flow started).
-
-Result: The measurement window covers a full `DURATION` with both flows active (assuming they connect successfully). Total wall time ≈ `DURATION + start_delay`.
-
-Negative delays are clamped to `0.0`.
-
-## Tips
-- Increase `DURATION` if additional post-warmup steady-state data is needed.
-- Use `l4s_start_ts_ns` / `classic_start_ts_ns` to segment analysis before and after second flow arrival.
-- If TCP metrics are `None`, verify the `ss` command shows a matching socket and that DualPI2 qdisc is attached to `veth-s`.
-- Use `--debug-samples` for quick parsing diagnostics.
-- If plots not generated, install `pandas` and `matplotlib`.
-
-## Quick Install (optional libs)
-```
-pip install pandas matplotlib
-```
+- This file is specific to `rebuild_dualpi2.sh`. The repository’s original `README.md` remains unchanged for broader context. If you prefer, you can link to this doc from the main README.
